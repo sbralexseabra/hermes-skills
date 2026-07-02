@@ -1,0 +1,176 @@
+diff --git a/gateway/platforms/base.py b/gateway/platforms/base.py
+index 1025964..f5b4941 100644
+--- a/gateway/platforms/base.py
++++ b/gateway/platforms/base.py
+@@ -4965,8 +4965,23 @@ class BasePlatformAdapter(ABC):
+                             speech_text = self.prepare_tts_text(text_content)
+                             if not speech_text:
+                                 raise ValueError("Empty text after markdown cleanup")
++                            # No explicit output_path here previously meant
++                            # text_to_speech_tool fell back to its own default
++                            # path selection, which — outside an agent-turn
++                            # context — can't detect the Telegram platform and
++                            # produces .mp3 (sent as a file attachment) instead
++                            # of .ogg (native voice bubble). self.platform is
++                            # known directly here, so force the right
++                            # extension explicitly instead.
++                            import tempfile as _tempfile
++                            _auto_tts_ext = "ogg" if self.platform == Platform.TELEGRAM else "mp3"
++                            _auto_tts_dir = os.path.join(_tempfile.gettempdir(), "hermes_voice")
++                            os.makedirs(_auto_tts_dir, exist_ok=True)
++                            _auto_tts_path = os.path.join(
++                                _auto_tts_dir, f"tts_auto_{uuid.uuid4().hex[:12]}.{_auto_tts_ext}"
++                            )
+                             tts_result_str = await asyncio.to_thread(
+-                                text_to_speech_tool, text=speech_text
++                                text_to_speech_tool, text=speech_text, output_path=_auto_tts_path
+                             )
+                             tts_data = _json.loads(tts_result_str)
+                             _tts_path = tts_data.get("file_path")
+diff --git a/gateway/run.py b/gateway/run.py
+index a5fe58f..7857793 100644
+--- a/gateway/run.py
++++ b/gateway/run.py
+@@ -85,6 +85,7 @@ _TELEGRAM_NOISY_STATUS_RE = re.compile(
+     r"|max\s+retries\s+\(\d+\).*(?:trying\s+fallback|exhausted|invalid\s+responses)"
+     r"|stream\s+(?:drop|drop\s+mid\s+tool-call).+retry\s+\d"
+     r"|stale\s+connections\s+from\s+a\s+previous\s+provider\s+issue"
++    r"|caps\s+context\s+at\s+\d+K,?\s+so\s+auto-compaction\s+was\s+raised"
+     r")",
+     re.IGNORECASE | re.DOTALL,
+ )
+diff --git a/tools/tts_tool.py b/tools/tts_tool.py
+index b71ebfa..e0753c3 100644
+--- a/tools/tts_tool.py
++++ b/tools/tts_tool.py
+@@ -2154,6 +2154,16 @@ def text_to_speech_tool(
+     if not text or not text.strip():
+         return tool_error("Text is required", success=False)
+ 
++    # Strip emoji unconditionally, regardless of caller. _send_voice_reply
++    # already runs _strip_markdown_for_tts before calling this tool, but the
++    # agent can also call text_to_speech directly with raw text (bypassing
++    # that wrapper) — without this, TTS providers read emoji aloud via their
++    # Unicode CLDR description (e.g. "🔊" -> "alto-falante com três ondas de
++    # som" on Edge TTS).
++    text = _EMOJI_RE.sub('', text).strip()
++    if not text:
++        return tool_error("Text is required", success=False)
++
+     tts_config = _load_tts_config()
+     provider = _get_provider(tts_config)
+ 
+@@ -2343,15 +2353,43 @@ def text_to_speech_tool(
+                 edge_available = False
+ 
+             if edge_available:
++                # Edge TTS always streams MP3-encoded bytes regardless of the
++                # target filename — it does no format conversion itself. A
++                # caller (or _send_voice_reply) that explicitly requests a
++                # .ogg output_path would otherwise get raw MP3 data saved
++                # under a .ogg name: invalid for Telegram voice bubbles, and
++                # the opus-conversion step below skips it because the path
++                # already "ends with .ogg" (even though nothing was actually
++                # converted). Generate to an .mp3 sibling instead so that
++                # step runs for real and lands the result back at the
++                # originally-requested .ogg path.
++                _edge_requested_ogg = file_str.endswith(".ogg")
++                _edge_gen_path = file_str[: -len(".ogg")] + ".mp3" if _edge_requested_ogg else file_str
+                 logger.info("Generating speech with Edge TTS...")
+                 try:
+                     import concurrent.futures
+                     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                         pool.submit(
+-                            lambda: asyncio.run(_generate_edge_tts(text, file_str, tts_config))
++                            lambda: asyncio.run(_generate_edge_tts(text, _edge_gen_path, tts_config))
+                         ).result(timeout=60)
+                 except RuntimeError:
+-                    asyncio.run(_generate_edge_tts(text, file_str, tts_config))
++                    asyncio.run(_generate_edge_tts(text, _edge_gen_path, tts_config))
++                if _edge_requested_ogg:
++                    _opus_path = _convert_to_opus(_edge_gen_path)
++                    if _opus_path:
++                        file_str = _opus_path
++                        try:
++                            os.remove(_edge_gen_path)
++                        except OSError:
++                            pass
++                    else:
++                        # ffmpeg unavailable/failed — fall back to the raw
++                        # MP3 rather than shipping mislabeled data.
++                        logger.warning(
++                            "Opus conversion failed for Edge TTS output; "
++                            "keeping MP3 at %s", _edge_gen_path,
++                        )
++                        file_str = _edge_gen_path
+             elif _check_neutts_available():
+                 logger.info("Edge TTS not available, falling back to NeuTTS (local)...")
+                 provider = "neutts"
+@@ -2397,15 +2435,18 @@ def text_to_speech_tool(
+                     if opus_path:
+                         file_str = opus_path
+                 voice_compatible = file_str.endswith(".ogg")
+-        elif (
+-            want_opus
+-            and provider in {"edge", "neutts", "minimax", "xai", "kittentts", "piper"}
+-            and not file_str.endswith(".ogg")
+-        ):
+-            opus_path = _convert_to_opus(file_str)
+-            if opus_path:
+-                file_str = opus_path
+-                voice_compatible = True
++        elif provider in {"edge", "neutts", "minimax", "xai", "kittentts", "piper"}:
++            # Convert whenever Opus is wanted (session detected the platform)
++            # OR the caller already asked for .ogg explicitly (e.g. Edge
++            # TTS's explicit-.ogg-output_path branch converts up front,
++            # regardless of want_opus — session-platform detection isn't
++            # available in every calling context, see gateway/platforms/
++            # base.py's auto-TTS path).
++            if not file_str.endswith(".ogg") and want_opus:
++                opus_path = _convert_to_opus(file_str)
++                if opus_path:
++                    file_str = opus_path
++            voice_compatible = file_str.endswith(".ogg")
+         elif provider in {"elevenlabs", "openai", "mistral", "gemini"}:
+             voice_compatible = want_opus and file_str.endswith(".ogg")
+ 
+@@ -2551,10 +2592,29 @@ _MD_HEADER = re.compile(r'^#+\s*', flags=re.MULTILINE)
+ _MD_LIST_ITEM = re.compile(r'^\s*[-*]\s+', flags=re.MULTILINE)
+ _MD_HR = re.compile(r'---+')
+ _MD_EXCESS_NL = re.compile(r'\n{3,}')
++_EXCESS_SPACE = re.compile(r'[ \t]{2,}')
++
++# Emoji ranges (pictographs, emoticons, dingbats, flags, variation
++# selectors, ZWJ). Edge TTS reads these aloud via their Unicode CLDR
++# description (e.g. "🔊" -> "alto-falante com três ondas de som"), which is
++# never desired in spoken output — strip them before synthesis.
++_EMOJI_RE = re.compile(
++    "["
++    "\U0001F300-\U0001FAFF"  # symbols & pictographs (incl. emoticons, transport, supplemental)
++    "\U00002600-\U000026FF"  # misc symbols
++    "\U00002700-\U000027BF"  # dingbats
++    "\U0001F1E6-\U0001F1FF"  # regional indicators (flag letters)
++    "\U0001F000-\U0001F0FF"  # mahjong/domino/playing cards
++    "\U00002B00-\U00002BFF"  # misc symbols and arrows (stars, arrows used as emoji)
++    "\U0000FE0F"              # variation selector-16 (emoji presentation)
++    "\U0000200D"              # zero-width joiner (emoji ZWJ sequences)
++    "]+",
++    flags=re.UNICODE,
++)
+ 
+ 
+ def _strip_markdown_for_tts(text: str) -> str:
+-    """Remove markdown formatting that shouldn't be spoken aloud."""
++    """Remove markdown formatting and emoji that shouldn't be spoken aloud."""
+     text = _MD_CODE_BLOCK.sub(' ', text)
+     text = _MD_LINK.sub(r'\1', text)
+     text = _MD_URL.sub('', text)
+@@ -2564,6 +2624,8 @@ def _strip_markdown_for_tts(text: str) -> str:
+     text = _MD_HEADER.sub('', text)
+     text = _MD_LIST_ITEM.sub('', text)
+     text = _MD_HR.sub('', text)
++    text = _EMOJI_RE.sub('', text)
++    text = _EXCESS_SPACE.sub(' ', text)
+     text = _MD_EXCESS_NL.sub('\n\n', text)
+     return text.strip()
+ 
